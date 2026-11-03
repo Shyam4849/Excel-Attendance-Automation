@@ -1,0 +1,19 @@
+# Production settings for Streamlit Community Cloud.
+# Tuned to reduce backend stalls that show up as
+# "Failed to fetch dynamically imported module" in the browser.
+
+[server]
+# No local file-reload watching in the cloud — saves CPU/RAM.
+fileWatcherType = "none"
+# Script reruns only on user interaction, never on file save.
+runOnSave = false
+# xlsx uploads can be large; 200 MB is a safe ceiling.
+maxUploadSize = 200
+# Compress websocket frames to cut bandwidth on the free tier.
+enableWebsocketCompression = true
+# How long a disconnected session lingers before cleanup (seconds).
+disconnectedSessionTTL = 300
+
+[browser]
+# Do not phone home with usage stats.
+gatherUsageStats = false

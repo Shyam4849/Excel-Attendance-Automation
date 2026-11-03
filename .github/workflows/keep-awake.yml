@@ -1,0 +1,117 @@
+# Keeps the Streamlit Community Cloud app awake so it never hits the
+# sleep/wake window where static JS chunks (FileUploader.*.js etc.)
+# intermittently fail to load:
+#   TypeError: Failed to fetch dynamically imported module: ...
+#
+# Community Cloud hibernates apps after ~12 h without a real browser
+# session. Plain HTTP pings do NOT count (they only fetch the static
+# HTML shell; the Python process never starts). A headless Chromium
+# visit executes the page JS, opens the WebSocket, and clicks
+# "Yes, get this app back up!" if the app is asleep.
+#
+# Schedule: every 6 hours (well under the 12 h sleep timer; GitHub
+# Actions cron is best-effort and may drift a few minutes).
+#
+# NOTE: this app is private, so unauthenticated visits stop at the
+# login page and cannot open a session. The workflow therefore falls
+# back to an empty commit push, which triggers a redeploy via the
+# Community Cloud webhook and resets the sleep timer. If you ever make
+# the app public, the Playwright path alone is enough and the fallback
+# can be removed.
+
+name: Keep Streamlit awake
+
+on:
+  schedule:
+    - cron: "17 */6 * * *" # every 6 h at :17 (avoids the :00 cron storm)
+  workflow_dispatch: {}
+
+permissions:
+  contents: write # needed only for the empty-push fallback
+
+concurrency:
+  group: keep-awake
+  cancel-in-progress: false
+
+jobs:
+  wake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      APP_URL: https://excel-attendance-automation.streamlit.app/
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Playwright + Chromium
+        run: |
+          pip install --quiet playwright
+          playwright install --with-deps chromium
+
+      - name: Visit app in headless browser (wake if asleep)
+        id: visit
+        run: |
+          python - <<'EOF'
+          import os
+          import sys
+          from pathlib import Path
+          from playwright.sync_api import sync_playwright
+
+          url = os.environ["APP_URL"]
+          result = Path("/tmp/visit_result.txt")
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True)
+              page = browser.new_page(
+                  user_agent=(
+                      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/131.0.0.0 Safari/537.36"
+                  )
+              )
+              page.goto(url, wait_until="domcontentloaded", timeout=120_000)
+              page.wait_for_timeout(5_000)
+
+              # Private app -> redirected to share.streamlit.io login.
+              if "share.streamlit.io" in page.url and "/auth/" in page.url:
+                  result.write_text("PRIVATE\n", encoding="utf-8")
+                  print(f"Landed on auth page: {page.url}")
+                  browser.close()
+                  sys.exit(0)
+
+              wake = page.get_by_role("button", name="Yes, get this app back up!")
+              if wake.count() > 0:
+                  print("App asleep — clicking wake button.")
+                  wake.first.click()
+                  page.wait_for_timeout(60_000)
+              else:
+                  print("App already awake.")
+
+              # Hold the session open so the visit registers.
+              page.wait_for_timeout(30_000)
+              result.write_text("PUBLIC\n", encoding="utf-8")
+              print(f"Final URL: {page.url}")
+              browser.close()
+          EOF
+
+      - name: Fallback — empty push to force redeploy (private app)
+        if: always()
+        run: |
+          if [ -f /tmp/visit_result.txt ] && grep -q "PRIVATE" /tmp/visit_result.txt; then
+            echo "App is private; Playwright cannot open a session."
+            echo "Triggering a redeploy via empty commit to reset the sleep timer."
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "chore: keep-alive redeploy [skip ci]"
+            git push
+          elif [ -f /tmp/visit_result.txt ] && grep -q "PUBLIC" /tmp/visit_result.txt; then
+            echo "Public session established; nothing more to do."
+          else
+            echo "Visit step failed before writing a result; not pushing."
+            exit 1
+          fi
